@@ -20,6 +20,7 @@ use std::future::Future;
 
 mod binance;
 pub mod mock;
+pub mod simulated;
 
 pub trait ExecutionClient
 where
