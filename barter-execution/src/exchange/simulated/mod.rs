@@ -261,86 +261,11 @@ impl MockExchange {
             return (build_open_order_err_response(request, error), None);
         }
 
-        let underlying = match self.find_instrument_data(&request.key.instrument) {
-            Ok(instrument) => instrument.underlying.clone(),
-            Err(error) => return (build_open_order_err_response(request, error), None),
-        };
-
-        let time_exchange = self.time_exchange();
-
-        let balance_change_result = match request.state.side {
-            Side::Buy => {
-                // Buying Instrument requires sufficient QuoteAsset Balance
-                let current = self
-                    .account
-                    .balance_mut(&underlying.quote)
-                    .expect("MockExchange has Balance for all configured Instrument assets");
-
-                // Currently we only supported MarketKind orders, so they should be identical
-                assert_eq!(current.balance.total, current.balance.free);
-
-                let order_value_quote = request.state.price * request.state.quantity.abs();
-                let order_fees_quote = order_value_quote * self.fees_percent;
-                let quote_required = order_value_quote + order_fees_quote;
-
-                let maybe_new_balance = current.balance.free - quote_required;
-
-                if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((current.clone(), AssetFees::quote_fees(order_fees_quote)))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.quote,
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, quote_required
-                        ),
-                    ))
-                }
-            }
-            Side::Sell => {
-                // Selling Instrument requires sufficient BaseAsset Balance
-                let current = self
-                    .account
-                    .balance_mut(&underlying.quote)
-                    .expect("MockExchange has Balance for all configured Instrument assets");
-
-                // Currently we only supported MarketKind orders, so they should be identical
-                assert_eq!(current.balance.total, current.balance.free);
-
-                let order_value_base = request.state.quantity.abs();
-                let order_fees_base = order_value_base * self.fees_percent;
-                let base_required = order_value_base + order_fees_base;
-
-                let maybe_new_balance = current.balance.free - base_required;
-
-                if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    let fees_quote = order_fees_base * request.state.price;
-
-                    Ok((current.clone(), AssetFees::quote_fees(fees_quote)))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.quote,
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, base_required
-                        ),
-                    ))
-                }
-            }
-        };
-
-        let (balance_snapshot, fees) = match balance_change_result {
-            Ok((balance_snapshot, fees)) => (Snapshot(balance_snapshot), fees),
-            Err(error) => return (build_open_order_err_response(request, error), None),
-        };
+        let (balance_snapshot, fees) =
+            match self.has_sufficient_available_balance_for_request(&request) {
+                Ok((balance_snapshot, fees)) => (balance_snapshot, fees),
+                Err(error) => return (build_open_order_err_response(request, error), None),
+            };
 
         let order_id = self.order_id_sequence_fetch_add();
         let trade_id = TradeId(order_id.0.clone());
@@ -415,6 +340,70 @@ impl MockExchange {
         UnindexedAccountEvent {
             exchange: self.exchange,
             kind: kind.into(),
+        }
+    }
+
+    pub fn has_sufficient_available_balance_for_request(
+        &mut self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+    ) -> Result<
+        (
+            Snapshot<AssetBalance<AssetNameExchange>>,
+            AssetFees<QuoteAsset>,
+        ),
+        UnindexedApiError,
+    > {
+        let underlying = self
+            .find_instrument_data(&request.key.instrument)?
+            .underlying
+            .clone();
+
+        let time_exchange = self.time_exchange();
+
+        let (asset, fee_quote, required_amount) = match request.state.side {
+            Side::Buy => {
+                let asset = &underlying.quote;
+
+                let order_value = request.state.price * request.state.quantity.abs();
+                let fee = order_value * self.fees_percent;
+                let required = order_value + fee;
+
+                (asset, fee, required)
+            }
+            Side::Sell => {
+                let asset = &underlying.base;
+
+                let order_value_base = request.state.quantity.abs();
+                let fee_base = order_value_base * self.fees_percent;
+                let fee_quote = fee_base * request.state.price;
+                let required = order_value_base + fee_base;
+
+                (asset, fee_quote, required)
+            }
+        };
+
+        let current = self
+            .account
+            .balance_mut(asset)
+            .expect("MockExchange has Balance for all configured Instrument assets");
+
+        // Check if we have enough balance
+        let maybe_new_balance = current.balance.free - required_amount;
+
+        if maybe_new_balance >= Decimal::ZERO {
+            current.balance.free = maybe_new_balance;
+            current.balance.total -= required_amount;
+            current.time_exchange = time_exchange;
+
+            Ok((Snapshot(current.clone()), AssetFees::quote_fees(fee_quote)))
+        } else {
+            Err(UnindexedApiError::BalanceInsufficient(
+                asset.clone(),
+                format!(
+                    "Available Balance: {}, Required Balance inc. fees: {}",
+                    current.balance.free, required_amount
+                ),
+            ))
         }
     }
 }
