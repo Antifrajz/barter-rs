@@ -3,10 +3,7 @@ use crate::{
     balance::AssetBalance,
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
-    exchange::mock::{
-        account::AccountState,
-        request::{MockExchangeRequest, MockExchangeRequestKind},
-    },
+    exchange::mock::account::AccountState,
     order::{
         Order, OrderKind, UnindexedOrder,
         id::OrderId,
@@ -26,6 +23,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use futures::stream::BoxStream;
 use itertools::Itertools;
+use request::{SimulatedExchangeRequest, SimulatedExchangeRequestKind};
 use rust_decimal::Decimal;
 use smol_str::ToSmolStr;
 use std::fmt::Debug;
@@ -34,14 +32,15 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info};
 
 pub mod account;
+pub mod book;
 pub mod request;
 
 #[derive(Debug)]
-pub struct MockExchange {
+pub struct SimulatedExchange {
     pub exchange: ExchangeId,
     pub latency_ms: u64,
     pub fees_percent: Decimal,
-    pub request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
+    pub request_rx: mpsc::UnboundedReceiver<SimulatedExchangeRequest>,
     pub event_tx: broadcast::Sender<UnindexedAccountEvent>,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
@@ -49,10 +48,10 @@ pub struct MockExchange {
     pub time_exchange_latest: DateTime<Utc>,
 }
 
-impl MockExchange {
+impl SimulatedExchange {
     pub fn new(
         config: MockExecutionConfig,
-        request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
+        request_rx: mpsc::UnboundedReceiver<SimulatedExchangeRequest>,
         event_tx: broadcast::Sender<UnindexedAccountEvent>,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     ) -> Self {
@@ -74,36 +73,36 @@ impl MockExchange {
             self.update_time_exchange(request.time_request);
 
             match request.kind {
-                MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
+                SimulatedExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
                     let snapshot = self.account_snapshot();
                     self.respond_with_latency(response_tx, snapshot);
                 }
-                MockExchangeRequestKind::FetchBalances { response_tx } => {
+                SimulatedExchangeRequestKind::FetchBalances { response_tx } => {
                     let balances = self.account.balances().cloned().collect();
                     self.respond_with_latency(response_tx, balances);
                 }
-                MockExchangeRequestKind::FetchOrdersOpen { response_tx } => {
+                SimulatedExchangeRequestKind::FetchOrdersOpen { response_tx } => {
                     let orders_open = self.account.orders_open().cloned().collect();
                     self.respond_with_latency(response_tx, orders_open);
                 }
-                MockExchangeRequestKind::FetchTrades {
+                SimulatedExchangeRequestKind::FetchTrades {
                     response_tx,
                     time_since,
                 } => {
                     let trades = self.account.trades(time_since).cloned().collect();
                     self.respond_with_latency(response_tx, trades);
                 }
-                MockExchangeRequestKind::CancelOrder {
+                SimulatedExchangeRequestKind::CancelOrder {
                     response_tx: _,
                     request,
                 } => {
                     error!(
                         exchange = %self.exchange,
                         ?request,
-                        "MockExchange received cancel request but only Market orders are supported"
+                        "SimulatedExchange received cancel request but only Market orders are supported"
                     );
                 }
-                MockExchangeRequestKind::OpenOrder {
+                SimulatedExchangeRequestKind::OpenOrder {
                     response_tx,
                     request,
                 } => {
@@ -118,7 +117,7 @@ impl MockExchange {
             }
         }
 
-        info!(exchange = %self.exchange, "MockExchange shutting down");
+        info!(exchange = %self.exchange, "SimulatedExchange shutting down");
     }
 
     fn update_time_exchange(&mut self, time_request: DateTime<Utc>) {
@@ -189,13 +188,13 @@ impl MockExchange {
                 error!(
                     %exchange,
                     kind = std::any::type_name::<Response>(),
-                    "MockExchange failed to send oneshot response to client"
+                    "SimulatedExchange failed to send oneshot response to client"
                 );
             }
         });
     }
 
-    /// Sends the provided `OpenOrderNotifications` via the `MockExchanges`
+    /// Sends the provided `OpenOrderNotifications` via the `SimulatedExchanges`
     /// `broadcast::Sender<UnindexedAccountEvent>` after waiting for the latency
     /// [`Duration`].
     ///
@@ -214,7 +213,7 @@ impl MockExchange {
                 error!(
                     %exchange,
                     kind = "Snapshot<AssetBalance<AssetNameExchange>",
-                    "MockExchange failed to send AccountEvent notification to client"
+                    "SimulatedExchange failed to send AccountEvent notification to client"
                 );
             }
 
@@ -222,7 +221,7 @@ impl MockExchange {
                 error!(
                     %exchange,
                     kind = "Trade<QuoteAsset, InstrumentNameExchange>",
-                    "MockExchange failed to send AccountEvent notification to client"
+                    "SimulatedExchange failed to send AccountEvent notification to client"
                 );
             }
         });
@@ -235,7 +234,7 @@ impl MockExchange {
                 Err(error) => {
                     error!(
                         ?error,
-                        "MockExchange Broadcast AccountStream lagged - terminating"
+                        "SimulatedExchange Broadcast AccountStream lagged - terminating"
                     );
                     None
                 }
@@ -257,10 +256,6 @@ impl MockExchange {
         Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
         Option<OpenOrderNotifications>,
     ) {
-        if let Err(error) = self.validate_order_kind_supported(request.state.kind) {
-            return (build_open_order_err_response(request, error), None);
-        }
-
         let (balance_snapshot, fees) =
             match self.has_sufficient_available_balance_for_request(&request) {
                 Ok((balance_snapshot, fees)) => (balance_snapshot, fees),
@@ -302,19 +297,6 @@ impl MockExchange {
         (order_response, Some(notifications))
     }
 
-    pub fn validate_order_kind_supported(
-        &self,
-        order_kind: OrderKind,
-    ) -> Result<(), UnindexedOrderError> {
-        if order_kind == OrderKind::Market {
-            Ok(())
-        } else {
-            Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                format!("MockExchange does not supported OrderKind: {order_kind}"),
-            )))
-        }
-    }
-
     pub fn find_instrument_data(
         &self,
         instrument: &InstrumentNameExchange,
@@ -322,7 +304,10 @@ impl MockExchange {
         self.instruments.get(instrument).ok_or_else(|| {
             ApiError::InstrumentInvalid(
                 instrument.clone(),
-                format!("MockExchange is not set-up for managing: {}", instrument),
+                format!(
+                    "SimulatedExchange is not set-up for managing: {}",
+                    instrument
+                ),
             )
         })
     }
@@ -385,7 +370,7 @@ impl MockExchange {
         let current = self
             .account
             .balance_mut(asset)
-            .expect("MockExchange has Balance for all configured Instrument assets");
+            .expect("SimulatedExchange has Balance for all configured Instrument assets");
 
         // Check if we have enough balance
         let maybe_new_balance = current.balance.free - required_amount;
